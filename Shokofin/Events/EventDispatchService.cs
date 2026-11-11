@@ -132,6 +132,10 @@ public class EventDispatchService {
     }
 
     private void OnIntervalElapsed(object? sender, ElapsedEventArgs eventArgs) {
+        // Keep the queued events until the library scan has completed.
+        if (LibraryScanWatcher.IsScanRunning)
+            return;
+
         var filesToProcess = new List<(int, List<(UpdateReason Reason, int ManagedFolderId, string Path, IFileEventArgs Event)>, Guid trackerId)>();
         var unresolvedFilesToProcess = new List<(int, List<(UpdateReason Reason, int ManagedFolderId, string Path, IFileEventArgs Event)>, Guid trackerId, DateTime insertedAt)>();
         var seriesToProcess = new List<(string, List<IMetadataUpdatedEventArgs>, Guid trackerId)>();
@@ -281,11 +285,39 @@ public class EventDispatchService {
         }
     }
 
+    /// <summary>
+    /// Put file events back in the queue so they get processed once the
+    /// library scan that interrupted them has completed.
+    /// </summary>
+    private void RequeueFileEvents(int fileId, List<(UpdateReason Reason, int ManagedFolderId, string Path, IFileEventArgs Event)> changes, Guid trackerId, DateTime? insertedAt) {
+        if (insertedAt.HasValue) {
+            AddUnresolvedFile(fileId, changes, trackerId, insertedAt.Value);
+            return;
+        }
+
+        lock (ChangesPerFile) {
+            if (ChangesPerFile.TryGetValue(fileId, out var tuple)) {
+                Plugin.Instance.Tracker.Remove(trackerId);
+                tuple.List.InsertRange(0, changes);
+            }
+            else {
+                ChangesPerFile.Add(fileId, (DateTime.Now, [.. changes], trackerId));
+            }
+        }
+    }
+
+    private async Task WaitForLibraryScanToEnd() {
+        while (LibraryScanWatcher.IsScanRunning)
+            await Task.Delay(TimeSpan.FromSeconds(1));
+    }
+
     private async Task ProcessFileEvents(int fileId, List<(UpdateReason Reason, int ManagedFolderId, string Path, IFileEventArgs Event)> changes, Guid trackerId, ConcurrentDictionary<Guid, Folder> affectedFolders, DateTime? insertedAt = null, bool skipUnresolvedCheck = false) {
         var keepTracker = false;
         try {
             if (LibraryScanWatcher.IsScanRunning) {
-                Logger.LogInformation("Skipped processing {EventCount} file change events because a library scan is running. (File={FileId})", changes.Count, fileId);
+                Logger.LogInformation("Deferring {EventCount} file change events until the library scan completes. (File={FileId})", changes.Count, fileId);
+                RequeueFileEvents(fileId, changes, trackerId, insertedAt);
+                keepTracker = true;
                 return;
             }
 
@@ -463,9 +495,12 @@ public class EventDispatchService {
             }
 
             aLabelToReduceNesting:;
+            // The links are already in the VFS, so wait for the scan to end
+            // instead of skipping the notification, or the new items would
+            // only show up after the next refresh.
             if (LibraryScanWatcher.IsScanRunning) {
-                Logger.LogDebug("Skipped notifying Jellyfin about {LocationCount} changes because a library scan is running. (File={FileId})", locationsToNotify.Count, fileId.ToString());
-                return;
+                Logger.LogDebug("Waiting for the library scan to complete before notifying Jellyfin about {LocationCount} changes. (File={FileId})", locationsToNotify.Count, fileId.ToString());
+                await WaitForLibraryScanToEnd();
             }
 
             // We let jellyfin take it from here.
@@ -630,6 +665,20 @@ public class EventDispatchService {
     }
 
     private async Task ProcessMetadataEvents(string metadataId, List<IMetadataUpdatedEventArgs> events, Guid trackerId) {
+        if (LibraryScanWatcher.IsScanRunning) {
+            Logger.LogDebug("Deferring {EventCount} metadata change events until the library scan completes. (Metadata={ProviderUniqueId})", events.Count, metadataId);
+            lock (ChangesPerSeries) {
+                if (ChangesPerSeries.TryGetValue(metadataId, out var tuple)) {
+                    Plugin.Instance.Tracker.Remove(trackerId);
+                    tuple.List.InsertRange(0, events);
+                }
+                else {
+                    ChangesPerSeries.Add(metadataId, (DateTime.Now, [.. events], trackerId));
+                }
+            }
+            return;
+        }
+
         try {
             var tasks = new List<Task>();
             if (events.Where(e => e.IsImageUpdate).ToList() is { Count: > 0 } imageEvents)
