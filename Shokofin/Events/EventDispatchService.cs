@@ -780,8 +780,8 @@ public class EventDispatchService {
     private async Task ProcessMetadataUpdateEvents(string metadataId, List<IMetadataUpdatedEventArgs> changes) {
         try {
             if (LibraryScanWatcher.IsScanRunning) {
-                Logger.LogDebug("Skipped processing {EventCount} metadata change events because a library scan is running. (Metadata={ProviderUniqueId})", changes.Count, metadataId);
-                return;
+                Logger.LogDebug("Waiting for the library scan to complete before processing {EventCount} metadata change events. (Metadata={ProviderUniqueId})", changes.Count, metadataId);
+                await WaitForLibraryScanToEnd();
             }
 
             if (!changes.Any(e => e.Kind is BaseItemKind.Episode or BaseItemKind.Movie && e.EpisodeIds.Count > 0 || e.Kind is BaseItemKind.Series && e.SeriesIds.Count > 0)) {
